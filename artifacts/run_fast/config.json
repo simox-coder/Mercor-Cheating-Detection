@@ -1,0 +1,11 @@
+{
+  "data": ".",
+  "out": "artifacts/run_fast",
+  "n_folds": 3,
+  "seed": 42,
+  "pu_weight": 0.05,
+  "skip_embeddings": true,
+  "skip_propagation": true,
+  "fast": true,
+  "start_time": "2025-12-23T15:13:01.201357"
+}
