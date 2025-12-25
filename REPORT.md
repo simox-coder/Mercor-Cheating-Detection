@@ -4,6 +4,21 @@
 
 This solution implements a leakage-safe machine learning pipeline for the Mercor Cheating Detection Kaggle competition. The goal is to predict whether a user is cheating based on tabular features and social graph connections, optimizing for a cost-based evaluation metric.
 
+## Quick Start
+
+```bash
+pip install -r requirements.txt
+python metric_tests.py     # Verify metric (7/7 pass)
+python train_fast.py       # Run experiment with proxy validation
+```
+
+## Experiment Tracking
+
+All experiments are logged to `artifacts/exp_log.csv` with:
+- CV cost on full labeled set
+- Public/private proxy costs (50/50 stratified split)
+- Stability metric between proxy splits
+
 ## Metric
 
 The competition uses a cost-based metric with 3 decision regions:
