@@ -1,0 +1,19 @@
+{
+  "model_type": "lgb",
+  "params": {
+    "n_estimators": 719,
+    "learning_rate": 0.023203536553136832,
+    "num_leaves": 28,
+    "max_depth": 7,
+    "min_child_samples": 8,
+    "subsample": 0.954660201039391,
+    "colsample_bytree": 0.6293899908000085,
+    "reg_alpha": 0.009176996354542699,
+    "reg_lambda": 6.388511557344611e-06,
+    "scale_pos_weight": 3.0802720847112433
+  },
+  "cv_cost": 4400250.0,
+  "proxy_public_cost": 2189650.0,
+  "proxy_private_cost": 2206700.0,
+  "pseudo_weight": 0.015599452033620266
+}
