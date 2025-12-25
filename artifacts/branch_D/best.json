@@ -1,0 +1,13 @@
+{
+  "model_type": "lgb_multihop",
+  "params": {
+    "n_estimators": 500,
+    "learning_rate": 0.03,
+    "num_leaves": 63,
+    "max_depth": 8,
+    "scale_pos_weight": 2.5
+  },
+  "cv_cost": 4299350.0,
+  "proxy_public_cost": 2143150.0,
+  "proxy_private_cost": 2152400.0
+}

@@ -890,50 +890,46 @@ class BranchD(ModelTrainer):
         super().__init__(data_loader, feature_engineer, 'D', out_dir)
     
     def create_multihop_features(self, df: pd.DataFrame, base_preds: Optional[np.ndarray] = None) -> pd.DataFrame:
-        """Create multi-hop aggregated features (pseudo-GNN approach)."""
+        """Create multi-hop aggregated features (pseudo-GNN approach) - simplified for speed."""
         graph = self.dl.graph
         user_hashes = df['user_hash'].values
         
         features = pd.DataFrame(index=df.index)
         
-        # 1-hop statistics
-        hop1_stats = []
+        # Pre-compute degrees for efficiency
+        degree_dict = dict(graph.degree())
+        
+        # 1-hop statistics (efficient)
+        hop1_counts = []
+        hop1_sum_neighbor_deg = []
+        
         for uh in user_hashes:
-            if uh in graph and graph.degree(uh) > 0:
-                neighbors = list(graph.neighbors(uh))
-                hop1_stats.append({
-                    'hop1_count': len(neighbors),
-                    'hop1_log_count': np.log1p(len(neighbors))
-                })
+            if uh in graph:
+                deg = degree_dict.get(uh, 0)
+                hop1_counts.append(deg)
+                if deg > 0:
+                    # Sum of neighbor degrees (approximation of 2-hop reach)
+                    neighbors = list(graph.neighbors(uh))
+                    sum_nd = sum(degree_dict.get(n, 0) for n in neighbors)
+                    hop1_sum_neighbor_deg.append(sum_nd)
+                else:
+                    hop1_sum_neighbor_deg.append(0)
             else:
-                hop1_stats.append({'hop1_count': 0, 'hop1_log_count': 0})
+                hop1_counts.append(0)
+                hop1_sum_neighbor_deg.append(0)
         
-        features['hop1_count'] = [s['hop1_count'] for s in hop1_stats]
-        features['hop1_log_count'] = [s['hop1_log_count'] for s in hop1_stats]
+        features['hop1_count'] = hop1_counts
+        features['hop1_log_count'] = np.log1p(hop1_counts)
+        features['hop1_sum_neighbor_deg'] = hop1_sum_neighbor_deg
+        features['hop1_avg_neighbor_deg'] = np.where(
+            np.array(hop1_counts) > 0,
+            np.array(hop1_sum_neighbor_deg) / np.array(hop1_counts),
+            0
+        )
         
-        # 2-hop statistics (unique nodes at distance 2)
-        hop2_stats = []
-        for uh in user_hashes:
-            if uh in graph and graph.degree(uh) > 0:
-                neighbors = set(graph.neighbors(uh))
-                hop2_nodes = set()
-                for n in neighbors:
-                    hop2_nodes.update(graph.neighbors(n))
-                hop2_nodes -= neighbors
-                hop2_nodes.discard(uh)
-                hop2_stats.append({
-                    'hop2_count': len(hop2_nodes),
-                    'hop2_log_count': np.log1p(len(hop2_nodes))
-                })
-            else:
-                hop2_stats.append({'hop2_count': 0, 'hop2_log_count': 0})
-        
-        features['hop2_count'] = [s['hop2_count'] for s in hop2_stats]
-        features['hop2_log_count'] = [s['hop2_log_count'] for s in hop2_stats]
-        
-        # Clustering coefficient (local)
-        cc = nx.clustering(graph)
-        features['clustering_coef'] = [cc.get(uh, 0) for uh in user_hashes]
+        # Approximate 2-hop reach using sum of neighbor degrees (much faster)
+        features['approx_hop2_reach'] = hop1_sum_neighbor_deg
+        features['log_approx_hop2_reach'] = np.log1p(hop1_sum_neighbor_deg)
         
         return features
     
