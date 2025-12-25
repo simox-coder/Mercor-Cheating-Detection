@@ -1138,10 +1138,12 @@ def main(data_dir: str = '.', out_dir: str = 'artifacts',
     # Run baselines
     run_baselines(dl)
     
+    data_path = Path(data_dir)
+    
     # Branch A
     branch_a = BranchA(dl, fe, out_path / 'branch_A')
     preds_a = branch_a.run(budget_fast=budget_fast, budget_bo=budget_bo)
-    save_submission(preds_a, dl.test, data_dir + '/submission_A.csv')
+    save_submission(preds_a, dl.test, str(data_path / 'submission_A.csv'))
     
     if branch_a.best_config:
         update_scoreboard(
@@ -1157,7 +1159,7 @@ def main(data_dir: str = '.', out_dir: str = 'artifacts',
     # Branch B
     branch_b = BranchB(dl, fe, out_path / 'branch_B')
     preds_b = branch_b.run(budget_fast=budget_fast, budget_bo=budget_bo)
-    save_submission(preds_b, dl.test, data_dir + '/submission_B.csv')
+    save_submission(preds_b, dl.test, str(data_path / 'submission_B.csv'))
     
     if branch_b.best_config:
         update_scoreboard(
@@ -1173,7 +1175,7 @@ def main(data_dir: str = '.', out_dir: str = 'artifacts',
     # Branch C
     branch_c = BranchC(dl, fe, out_path / 'branch_C')
     preds_c = branch_c.run(budget_fast=budget_fast, budget_bo=budget_bo)
-    save_submission(preds_c, dl.test, data_dir + '/submission_C.csv')
+    save_submission(preds_c, dl.test, str(data_path / 'submission_C.csv'))
     
     if branch_c.best_config:
         update_scoreboard(
@@ -1189,7 +1191,7 @@ def main(data_dir: str = '.', out_dir: str = 'artifacts',
     # Branch D
     branch_d = BranchD(dl, fe, out_path / 'branch_D')
     preds_d = branch_d.run(budget_fast=budget_fast, budget_bo=budget_bo)
-    save_submission(preds_d, dl.test, data_dir + '/submission_D.csv')
+    save_submission(preds_d, dl.test, str(data_path / 'submission_D.csv'))
     
     if branch_d.best_config:
         update_scoreboard(
@@ -1207,8 +1209,8 @@ def main(data_dir: str = '.', out_dir: str = 'artifacts',
     print("="*70)
     print("\nGenerated submissions:")
     for branch in ['A', 'B', 'C', 'D']:
-        sub_path = f"{data_dir}/submission_{branch}.csv"
-        if os.path.exists(sub_path):
+        sub_path = data_path / f'submission_{branch}.csv'
+        if sub_path.exists():
             df = pd.read_csv(sub_path)
             print(f"  submission_{branch}.csv: {len(df)} rows")
     
