@@ -1,0 +1,13 @@
+{
+  "B": {
+    "branch": "B",
+    "method": "Graph Features + GBDT",
+    "oof_cost": 5297850,
+    "oof_score": -5297850,
+    "public_proxy_cost": 2644300,
+    "private_proxy_cost": 2653050,
+    "t_low": 0.0,
+    "t_high": 0.9400000000000001,
+    "submission_file": "submission_B.csv"
+  }
+}

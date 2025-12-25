@@ -1,0 +1,17 @@
+{
+  "branch": "A",
+  "method": "Tabular GBDT Ensemble",
+  "oof_cost": 5310000,
+  "oof_score": -5310000,
+  "public_proxy_cost": 2656400,
+  "private_proxy_cost": 2652600,
+  "t_low": 0.0,
+  "t_high": 0.93,
+  "blend_method": "average",
+  "models": [
+    "lgbm",
+    "xgb",
+    "cat"
+  ],
+  "submission_file": "submission_A.csv"
+}
