@@ -1,0 +1,157 @@
+{
+  "n_folds": 5,
+  "seed": 42,
+  "n_samples": 112966,
+  "n_cheaters": 34431,
+  "fold_results": [
+    {
+      "fold": 1,
+      "n_train": 90372,
+      "n_val": 22594,
+      "cost_lgb": 1462480,
+      "cost_xgb": 1461485,
+      "cost_cat": 1466420,
+      "cost_blend": 1451415
+    },
+    {
+      "fold": 2,
+      "n_train": 90373,
+      "n_val": 22593,
+      "cost_lgb": 1510195,
+      "cost_xgb": 1504500,
+      "cost_cat": 1506905,
+      "cost_blend": 1497410
+    },
+    {
+      "fold": 3,
+      "n_train": 90373,
+      "n_val": 22593,
+      "cost_lgb": 1462985,
+      "cost_xgb": 1470670,
+      "cost_cat": 1473075,
+      "cost_blend": 1462295
+    },
+    {
+      "fold": 4,
+      "n_train": 90373,
+      "n_val": 22593,
+      "cost_lgb": 1494835,
+      "cost_xgb": 1498440,
+      "cost_cat": 1499450,
+      "cost_blend": 1487090
+    },
+    {
+      "fold": 5,
+      "n_train": 90373,
+      "n_val": 22593,
+      "cost_lgb": 1470940,
+      "cost_xgb": 1464655,
+      "cost_cat": 1454510,
+      "cost_blend": 1455140
+    }
+  ],
+  "oof_results": {
+    "LGB": {
+      "cost": 7413515,
+      "score": -7413515,
+      "t_low": 0.2,
+      "t_high": 0.9400000000000001,
+      "n_auto_pass": 58444,
+      "n_manual_review": 46166,
+      "n_auto_block": 8356,
+      "breakdown": {
+        "total_cost": 7413515,
+        "n_auto_pass": 58444,
+        "n_manual_review": 46166,
+        "n_auto_block": 8356,
+        "fn_auto_pass": 5719,
+        "fp_auto_block": 57,
+        "fp_manual": 25753,
+        "tp_manual": 20413,
+        "tp_auto_block": 8299,
+        "tn_auto_pass": 52725,
+        "cost_fn_auto_pass": 3431400,
+        "cost_fp_auto_block": 17100,
+        "cost_fp_manual": 3862950,
+        "cost_tp_manual": 102065
+      }
+    },
+    "XGB": {
+      "cost": 7412810,
+      "score": -7412810,
+      "t_low": 0.195,
+      "t_high": 0.97,
+      "n_auto_pass": 57590,
+      "n_manual_review": 48090,
+      "n_auto_block": 7286,
+      "breakdown": {
+        "total_cost": 7412810,
+        "n_auto_pass": 57590,
+        "n_manual_review": 48090,
+        "n_auto_block": 7286,
+        "fn_auto_pass": 5546,
+        "fp_auto_block": 23,
+        "fp_manual": 26468,
+        "tp_manual": 21622,
+        "tp_auto_block": 7263,
+        "tn_auto_pass": 52044,
+        "cost_fn_auto_pass": 3327600,
+        "cost_fp_auto_block": 6900,
+        "cost_fp_manual": 3970200,
+        "cost_tp_manual": 108110
+      }
+    },
+    "CAT": {
+      "cost": 7419820,
+      "score": -7419820,
+      "t_low": 0.215,
+      "t_high": 0.96,
+      "n_auto_pass": 60780,
+      "n_manual_review": 44631,
+      "n_auto_block": 7555,
+      "breakdown": {
+        "total_cost": 7419820,
+        "n_auto_pass": 60780,
+        "n_manual_review": 44631,
+        "n_auto_block": 7555,
+        "fn_auto_pass": 6197,
+        "fp_auto_block": 35,
+        "fp_manual": 23917,
+        "tp_manual": 20714,
+        "tp_auto_block": 7520,
+        "tn_auto_pass": 54583,
+        "cost_fn_auto_pass": 3718200,
+        "cost_fp_auto_block": 10500,
+        "cost_fp_manual": 3587550,
+        "cost_tp_manual": 103570
+      }
+    },
+    "BLEND": {
+      "cost": 7379660,
+      "score": -7379660,
+      "t_low": 0.2,
+      "t_high": 0.9550000000000001,
+      "n_auto_pass": 58213,
+      "n_manual_review": 46993,
+      "n_auto_block": 7760,
+      "breakdown": {
+        "total_cost": 7379660,
+        "n_auto_pass": 58213,
+        "n_manual_review": 46993,
+        "n_auto_block": 7760,
+        "fn_auto_pass": 5627,
+        "fp_auto_block": 38,
+        "fp_manual": 25911,
+        "tp_manual": 21082,
+        "tp_auto_block": 7722,
+        "tn_auto_pass": 52586,
+        "cost_fn_auto_pass": 3376200,
+        "cost_fp_auto_block": 11400,
+        "cost_fp_manual": 3886650,
+        "cost_tp_manual": 105410
+      }
+    }
+  },
+  "best_model": "BLEND",
+  "timestamp": "2025-12-23T17:22:43.760364"
+}
