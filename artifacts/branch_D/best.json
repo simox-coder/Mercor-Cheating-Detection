@@ -1,13 +1,11 @@
 {
-  "params": {
-    "n_estimators": 1500,
-    "learning_rate": 0.03,
+  "cfg": {
+    "scale_pos_weight": 5.0,
     "num_leaves": 63,
-    "min_data_in_leaf": 50,
-    "subsample": 0.8,
-    "colsample_bytree": 0.8,
-    "scale_pos_weight": 3.0
+    "lr": 0.01,
+    "n_est": 2500
   },
-  "proxy_public_estimate": 2132750,
-  "notes": "Best from random search stage 1"
+  "cv": 4456150.0,
+  "pub": 2219800.0,
+  "priv": 2230100.0
 }
