@@ -1,15 +1,17 @@
 {
   "trial_id": 5,
   "config": {
-    "scale_pos_weight": 2.0,
+    "scale_pos_weight": 1.5,
     "num_leaves": 63,
     "lr": 0.01,
     "n_est": 1500,
-    "min_child": 20
+    "min_child": 20,
+    "subsample": 0.8,
+    "colsample": 0.8
   },
-  "cv_cost": 4352600.0,
-  "proxy_public": 2164350.0,
-  "proxy_private": 2188050.0,
-  "t_low": 0.18,
-  "t_high": 0.68
+  "cv_cost": 4314800.0,
+  "proxy_public": 2150250.0,
+  "proxy_private": 2161200.0,
+  "t_low": 0.15,
+  "t_high": 0.6
 }

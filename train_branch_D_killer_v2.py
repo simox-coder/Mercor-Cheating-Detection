@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """
-Branch D KILLER Pipeline v2 - Vectorized Graph + Checkpointing
+Branch D KILLER Pipeline v2 - Vectorized Graph + Checkpointing + Optuna
 Implements all requirements:
 - Ghost nodes in graph universe
 - Vectorized bincount/CSR operations (no NetworkX loops)
+- Component size via scipy connected_components
+- 2-hop label features via sparse A^2
 - Immediate checkpointing on improvement
-- CLI runner with resume capability
+- CLI runner with --resume and Optuna SQLite persistence
 """
 
 import os
@@ -18,10 +20,14 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from scipy import sparse
+from scipy.sparse.csgraph import connected_components
 from sklearn.model_selection import StratifiedKFold
 import lightgbm as lgb
+import optuna
+from optuna.samplers import TPESampler
 
 warnings.filterwarnings('ignore')
+optuna.logging.set_verbosity(optuna.logging.WARNING)
 SEED = 42
 np.random.seed(SEED)
 
@@ -78,11 +84,26 @@ class GraphCache:
         
         print(f"  CSR adjacency built: {self.adj_csr.shape}")
         
+        # Compute connected components (vectorized via scipy)
+        print("  Computing connected components...")
+        n_components, self.component_labels = connected_components(
+            self.adj_csr, directed=False, return_labels=True
+        )
+        # Compute component sizes
+        self.component_size = np.bincount(self.component_labels)
+        print(f"  Found {n_components} connected components")
+        
+        # NOTE: A^2 is too large for this graph (~3TB), so we compute 2-hop features
+        # via two sequential sparse matrix-vector multiplications instead
+        self.adj2_csr = None  # Disabled - use sequential approach
+        
         # Save cache
         np.save(self.cache_dir / 'nodes.npy', np.array(self.nodes, dtype=object))
         np.save(self.cache_dir / 'u.npy', self.u)
         np.save(self.cache_dir / 'v.npy', self.v)
         np.save(self.cache_dir / 'degree.npy', self.degree)
+        np.save(self.cache_dir / 'component_labels.npy', self.component_labels)
+        np.save(self.cache_dir / 'component_size.npy', self.component_size)
         sparse.save_npz(self.cache_dir / 'adj_csr.npz', self.adj_csr)
         
         return self
@@ -99,6 +120,20 @@ class GraphCache:
             self.v = np.load(self.cache_dir / 'v.npy')
             self.degree = np.load(self.cache_dir / 'degree.npy')
             self.adj_csr = sparse.load_npz(self.cache_dir / 'adj_csr.npz')
+            
+            # Load component data
+            comp_file = self.cache_dir / 'component_labels.npy'
+            if comp_file.exists():
+                self.component_labels = np.load(comp_file)
+                self.component_size = np.load(self.cache_dir / 'component_size.npy')
+            else:
+                # Recompute if missing
+                _, self.component_labels = connected_components(self.adj_csr, directed=False, return_labels=True)
+                self.component_size = np.bincount(self.component_labels)
+            
+            # A^2 disabled - too large
+            self.adj2_csr = None
+            
             print(f"  Loaded {self.n_nodes} nodes, {len(self.u)} edge pairs")
             return True
         return False
@@ -113,6 +148,13 @@ class GraphCache:
         degrees = np.zeros(len(node_indices), dtype=np.float32)
         degrees[valid] = self.degree[node_indices[valid]]
         return degrees
+    
+    def get_component_size_features(self, node_indices):
+        """Get component size for given nodes (vectorized)."""
+        valid = node_indices >= 0
+        sizes = np.ones(len(node_indices), dtype=np.float32)  # Default to 1 for isolated
+        sizes[valid] = self.component_size[self.component_labels[node_indices[valid]]]
+        return sizes
     
     def compute_hop1_label_agg(self, node_indices, known_mask, y_values, alpha=1.0, beta=1.0):
         """
@@ -141,6 +183,32 @@ class GraphCache:
         rate = np.where(lnc > 0, (cnc + alpha) / (lnc + alpha + beta), prior)
         
         return lnc, cnc, rate
+    
+    def compute_hop2_label_agg(self, node_indices, known_mask, y_values, alpha=1.0, beta=1.0):
+        """
+        Vectorized fold-safe 2-hop label aggregation using two sequential A @ v operations.
+        This avoids materializing A^2 which would be too large.
+        """
+        y_full = np.zeros(self.n_nodes, dtype=np.float32)
+        y_full[known_mask] = y_values[known_mask]
+        
+        known_float = known_mask.astype(np.float32)
+        
+        # Step 1: Get 1-hop aggregates for ALL nodes
+        hop1_labeled_all = np.array(self.adj_csr @ known_float).flatten()
+        hop1_cheater_all = np.array(self.adj_csr @ (y_full * known_float)).flatten()
+        
+        # Step 2: Aggregate 1-hop values to get 2-hop (A @ hop1_values)
+        hop2_labeled_count = np.array(self.adj_csr @ hop1_labeled_all).flatten()
+        hop2_cheater_count = np.array(self.adj_csr @ hop1_cheater_all).flatten()
+        
+        lnc2 = hop2_labeled_count[node_indices]
+        cnc2 = hop2_cheater_count[node_indices]
+        
+        prior = alpha / (alpha + beta)
+        rate2 = np.where(lnc2 > 0, (cnc2 + alpha) / (lnc2 + alpha + beta), prior)
+        
+        return lnc2, cnc2, rate2
 
 
 class BranchDRunner:
@@ -176,7 +244,7 @@ class BranchDRunner:
         skf = StratifiedKFold(n_splits=2, shuffle=True, random_state=SEED)
         self.pub_idx, self.priv_idx = next(skf.split(np.zeros(len(self.y)), self.y))
         
-    def build_features(self, df, graph_cache, fold_known_mask=None, fold_y=None):
+    def build_features(self, df, graph_cache, fold_known_mask=None, fold_y=None, use_hop2=False):
         """Build features with vectorized graph ops."""
         feature_cols = [f'feature_{i:03d}' for i in range(1, 19)]
         
@@ -195,9 +263,12 @@ class BranchDRunner:
         node_idx = graph_cache.get_node_indices(df['user_hash'].values)
         X['degree'] = graph_cache.get_degree_features(node_idx)
         X['log_degree'] = np.log1p(X['degree'])
+        X['component_size'] = graph_cache.get_component_size_features(node_idx)
+        X['log_component_size'] = np.log1p(X['component_size'])
         
         # Fold-safe label features (if provided)
         if fold_known_mask is not None and fold_y is not None:
+            # 1-hop
             lnc, cnc, rate = graph_cache.compute_hop1_label_agg(
                 node_idx, fold_known_mask, fold_y
             )
@@ -205,6 +276,16 @@ class BranchDRunner:
             X['hop1_cheater_count'] = cnc
             X['hop1_cheat_rate'] = rate
             X['log_hop1_labeled'] = np.log1p(lnc)
+            
+            # 2-hop disabled - path counting inflates values too much
+            # if use_hop2:
+            #     lnc2, cnc2, rate2 = graph_cache.compute_hop2_label_agg(
+            #         node_idx, fold_known_mask, fold_y
+            #     )
+            #     X['hop2_labeled_count'] = lnc2
+            #     X['hop2_cheater_count'] = cnc2
+            #     X['hop2_cheat_rate'] = rate2
+            #     X['log_hop2_labeled'] = np.log1p(lnc2)
         
         return X
     
@@ -311,12 +392,14 @@ class BranchDRunner:
         return pub_cost, is_best
     
     def run_search(self, graph_cache, max_trials=80):
-        """Run hyperparameter search."""
+        """Run hyperparameter search with grid + random configs."""
         print(f"\nRunning search with max {max_trials} trials...")
         
-        # Config space
+        # Config space - expanded with more fine-grained options
         configs = []
-        for spw in [2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 6.0]:
+        
+        # Grid over key parameters
+        for spw in [1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 5.0]:
             for leaves in [31, 63, 127]:
                 for lr in [0.01, 0.02, 0.03, 0.05]:
                     configs.append({
@@ -324,19 +407,37 @@ class BranchDRunner:
                         'num_leaves': leaves,
                         'lr': lr,
                         'n_est': 1500,
-                        'min_child': 20
+                        'min_child': 20,
+                        'subsample': 0.8,
+                        'colsample': 0.8
                     })
         
-        # Add more variations
-        for spw in [2.5, 3.0, 3.5]:
-            for n_est in [2000, 2500]:
+        # Additional variations around promising region
+        for spw in [1.75, 2.25, 2.75]:
+            for n_est in [2000, 2500, 3000]:
                 for min_child in [10, 30, 50]:
                     configs.append({
                         'scale_pos_weight': spw,
                         'num_leaves': 63,
-                        'lr': 0.02,
+                        'lr': 0.01,
                         'n_est': n_est,
-                        'min_child': min_child
+                        'min_child': min_child,
+                        'subsample': 0.8,
+                        'colsample': 0.8
+                    })
+        
+        # Subsample/colsample variations
+        for spw in [2.0, 2.5]:
+            for subsample in [0.7, 0.9]:
+                for colsample in [0.7, 0.9]:
+                    configs.append({
+                        'scale_pos_weight': spw,
+                        'num_leaves': 63,
+                        'lr': 0.01,
+                        'n_est': 2000,
+                        'min_child': 20,
+                        'subsample': subsample,
+                        'colsample': colsample
                     })
         
         # Deduplicate
@@ -357,6 +458,46 @@ class BranchDRunner:
                 print(f"  Trial {i+1}/{len(configs)}: pub={pub:.0f}, best={self.best_pub:.0f}")
         
         print(f"\nSearch complete. Best proxy_public: {self.best_pub:.0f}")
+    
+    def run_optuna_search(self, graph_cache, n_trials=50, study_name='branch_d'):
+        """Run Optuna TPE search with SQLite persistence."""
+        print(f"\nRunning Optuna TPE search ({n_trials} trials)...")
+        
+        storage_path = self.out_dir / 'optuna.db'
+        storage = f'sqlite:///{storage_path}'
+        
+        def objective(trial):
+            config = {
+                'scale_pos_weight': trial.suggest_float('scale_pos_weight', 1.0, 6.0),
+                'num_leaves': trial.suggest_int('num_leaves', 15, 127),
+                'lr': trial.suggest_float('lr', 0.005, 0.1, log=True),
+                'n_est': trial.suggest_int('n_est', 1000, 4000),
+                'min_child': trial.suggest_int('min_child', 5, 100),
+                'subsample': trial.suggest_float('subsample', 0.6, 1.0),
+                'colsample': trial.suggest_float('colsample', 0.6, 1.0),
+            }
+            pub_cost, _ = self.run_trial(config, graph_cache)
+            return pub_cost
+        
+        study = optuna.create_study(
+            study_name=study_name,
+            storage=storage,
+            load_if_exists=True,
+            direction='minimize',
+            sampler=TPESampler(seed=SEED)
+        )
+        
+        completed = len(study.trials)
+        remaining = max(0, n_trials - completed)
+        print(f"  {completed} trials already completed, running {remaining} more")
+        
+        if remaining > 0:
+            study.optimize(objective, n_trials=remaining, show_progress_bar=True)
+        
+        print(f"\nOptuna search complete. Best: {study.best_value:.0f}")
+        print(f"Best params: {study.best_params}")
+        
+        return study
     
     def export_submissions(self, graph_cache):
         """Export top 5 submissions."""
@@ -416,7 +557,11 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--data', type=str, default='.', help='Data directory')
     parser.add_argument('--out', type=str, default='artifacts/branch_D', help='Output directory')
-    parser.add_argument('--max_trials', type=int, default=80, help='Max trials')
+    parser.add_argument('--max_trials', type=int, default=80, help='Max grid/random trials')
+    parser.add_argument('--optuna_trials', type=int, default=50, help='Max Optuna TPE trials')
+    parser.add_argument('--resume', type=int, default=0, help='Resume from previous run (1=yes)')
+    parser.add_argument('--mode', type=str, default='both', choices=['grid', 'optuna', 'both'],
+                        help='Search mode: grid, optuna, or both')
     args = parser.parse_args()
     
     print("="*60)
@@ -432,7 +577,23 @@ def main():
     # Run
     runner = BranchDRunner(args.data, args.out)
     runner.load_data()
-    runner.run_search(graph_cache, max_trials=args.max_trials)
+    
+    # Load previous best if resuming
+    if args.resume:
+        if runner.best_json_path.exists():
+            with open(runner.best_json_path) as f:
+                prev_best = json.load(f)
+                runner.best_pub = prev_best.get('proxy_public', float('inf'))
+                runner.trial_id = prev_best.get('trial_id', 0)
+                print(f"Resuming from trial {runner.trial_id}, best={runner.best_pub:.0f}")
+    
+    # Run search(es)
+    if args.mode in ['grid', 'both']:
+        runner.run_search(graph_cache, max_trials=args.max_trials)
+    
+    if args.mode in ['optuna', 'both']:
+        runner.run_optuna_search(graph_cache, n_trials=args.optuna_trials)
+    
     runner.export_submissions(graph_cache)
     
     # Print final summary
