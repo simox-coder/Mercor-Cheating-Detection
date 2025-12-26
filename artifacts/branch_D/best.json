@@ -1,11 +1,15 @@
 {
-  "cfg": {
-    "scale_pos_weight": 5.0,
+  "trial_id": 5,
+  "config": {
+    "scale_pos_weight": 2.0,
     "num_leaves": 63,
     "lr": 0.01,
-    "n_est": 2500
+    "n_est": 1500,
+    "min_child": 20
   },
-  "cv": 4456150.0,
-  "pub": 2219800.0,
-  "priv": 2230100.0
+  "cv_cost": 4352600.0,
+  "proxy_public": 2164350.0,
+  "proxy_private": 2188050.0,
+  "t_low": 0.18,
+  "t_high": 0.68
 }

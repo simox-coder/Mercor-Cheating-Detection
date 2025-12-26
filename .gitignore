@@ -28,3 +28,4 @@ Thumbs.db
 # Temporary files
 *.tmp
 *.temp
+artifacts/branch_D/cache/
