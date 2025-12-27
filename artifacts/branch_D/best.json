@@ -1,17 +1,19 @@
 {
-  "trial_id": 5,
+  "trial_id": 20,
   "config": {
-    "scale_pos_weight": 1.5,
-    "num_leaves": 63,
+    "scale_pos_weight": 2.0,
+    "num_leaves": 127,
     "lr": 0.01,
     "n_est": 1500,
     "min_child": 20,
     "subsample": 0.8,
-    "colsample": 0.8
+    "colsample": 0.8,
+    "alpha": 1.0,
+    "beta": 1.0
   },
-  "cv_cost": 4314800.0,
-  "proxy_public": 2150250.0,
-  "proxy_private": 2161200.0,
-  "t_low": 0.15,
-  "t_high": 0.6
+  "cv_cost": 4302850.0,
+  "proxy_public": 2142100.0,
+  "proxy_private": 2158550.0,
+  "t_low": 0.16,
+  "t_high": 0.67
 }

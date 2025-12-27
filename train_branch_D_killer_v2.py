@@ -158,25 +158,21 @@ class GraphCache:
     
     def compute_hop1_label_agg(self, node_indices, known_mask, y_values, alpha=1.0, beta=1.0):
         """
-        Vectorized fold-safe 1-hop label aggregation.
-        known_mask: boolean array over all nodes indicating which have known labels
-        y_values: label values for all nodes (only valid where known_mask=True)
+        Optimized fold-safe 1-hop label aggregation.
+        Only computes for requested nodes via CSR row-slicing (O(n_requested) not O(n_nodes)).
         """
         # Create label vector (0 for unknown)
         y_full = np.zeros(self.n_nodes, dtype=np.float32)
         y_full[known_mask] = y_values[known_mask]
-        
-        # Count of known labeled neighbors: adj @ known_mask
         known_float = known_mask.astype(np.float32)
-        labeled_neighbor_count = np.array(self.adj_csr @ known_float).flatten()
-        
-        # Sum of positive labels among neighbors: adj @ (y * known)
         y_known = y_full * known_float
-        cheater_neighbor_count = np.array(self.adj_csr @ y_known).flatten()
         
-        # Extract for requested nodes
-        lnc = labeled_neighbor_count[node_indices]
-        cnc = cheater_neighbor_count[node_indices]
+        # Row-slice adjacency for only requested nodes (fast)
+        sub_adj = self.adj_csr[node_indices]  # shape: (len(node_indices), n_nodes)
+        
+        # Compute aggregates only for requested rows
+        lnc = np.array(sub_adj @ known_float).flatten()  # labeled neighbor count
+        cnc = np.array(sub_adj @ y_known).flatten()      # cheater neighbor count
         
         # Bayesian smoothed rate
         prior = alpha / (alpha + beta)
@@ -184,31 +180,47 @@ class GraphCache:
         
         return lnc, cnc, rate
     
-    def compute_hop2_label_agg(self, node_indices, known_mask, y_values, alpha=1.0, beta=1.0):
+    def compute_hop2_label_agg_sampled(self, node_indices, known_mask, y_values, alpha=1.0, beta=1.0, max_neighbors=50):
         """
-        Vectorized fold-safe 2-hop label aggregation using two sequential A @ v operations.
-        This avoids materializing A^2 which would be too large.
+        Sampled 2-hop label aggregation. For each requested node, sample up to max_neighbors
+        from its 1-hop neighbors, then average their hop1 label stats.
+        This avoids materializing A^2 and keeps computation O(n_requested * max_neighbors).
         """
+        n_req = len(node_indices)
+        hop2_score = np.zeros(n_req, dtype=np.float32)
+        
+        # Precompute hop1 stats for ALL nodes to enable sampling
         y_full = np.zeros(self.n_nodes, dtype=np.float32)
         y_full[known_mask] = y_values[known_mask]
-        
         known_float = known_mask.astype(np.float32)
+        y_known = y_full * known_float
         
-        # Step 1: Get 1-hop aggregates for ALL nodes
-        hop1_labeled_all = np.array(self.adj_csr @ known_float).flatten()
-        hop1_cheater_all = np.array(self.adj_csr @ (y_full * known_float)).flatten()
-        
-        # Step 2: Aggregate 1-hop values to get 2-hop (A @ hop1_values)
-        hop2_labeled_count = np.array(self.adj_csr @ hop1_labeled_all).flatten()
-        hop2_cheater_count = np.array(self.adj_csr @ hop1_cheater_all).flatten()
-        
-        lnc2 = hop2_labeled_count[node_indices]
-        cnc2 = hop2_cheater_count[node_indices]
-        
+        # Get hop1 for all nodes (needed for neighbor lookup)
+        all_lnc = np.array(self.adj_csr @ known_float).flatten()
+        all_cnc = np.array(self.adj_csr @ y_known).flatten()
         prior = alpha / (alpha + beta)
-        rate2 = np.where(lnc2 > 0, (cnc2 + alpha) / (lnc2 + alpha + beta), prior)
+        all_hop1_rate = np.where(all_lnc > 0, (all_cnc + alpha) / (all_lnc + alpha + beta), prior)
         
-        return lnc2, cnc2, rate2
+        # For each requested node, sample neighbors and average their hop1 rate
+        rng = np.random.default_rng(SEED)
+        for i, nidx in enumerate(node_indices):
+            if nidx < 0:
+                hop2_score[i] = prior
+                continue
+            
+            # Get neighbors from CSR (efficient row slice)
+            start, end = self.adj_csr.indptr[nidx], self.adj_csr.indptr[nidx + 1]
+            neighbors = self.adj_csr.indices[start:end]
+            
+            if len(neighbors) == 0:
+                hop2_score[i] = prior
+            elif len(neighbors) <= max_neighbors:
+                hop2_score[i] = all_hop1_rate[neighbors].mean()
+            else:
+                sampled = rng.choice(neighbors, max_neighbors, replace=False)
+                hop2_score[i] = all_hop1_rate[sampled].mean()
+        
+        return hop2_score
 
 
 class BranchDRunner:
@@ -244,7 +256,8 @@ class BranchDRunner:
         skf = StratifiedKFold(n_splits=2, shuffle=True, random_state=SEED)
         self.pub_idx, self.priv_idx = next(skf.split(np.zeros(len(self.y)), self.y))
         
-    def build_features(self, df, graph_cache, fold_known_mask=None, fold_y=None, use_hop2=False):
+    def build_features(self, df, graph_cache, fold_known_mask=None, fold_y=None, 
+                       use_hop2=False, alpha=1.0, beta=1.0, hop2_max_neighbors=50):
         """Build features with vectorized graph ops."""
         feature_cols = [f'feature_{i:03d}' for i in range(1, 19)]
         
@@ -268,24 +281,22 @@ class BranchDRunner:
         
         # Fold-safe label features (if provided)
         if fold_known_mask is not None and fold_y is not None:
-            # 1-hop
+            # 1-hop with tunable alpha/beta
             lnc, cnc, rate = graph_cache.compute_hop1_label_agg(
-                node_idx, fold_known_mask, fold_y
+                node_idx, fold_known_mask, fold_y, alpha=alpha, beta=beta
             )
             X['hop1_labeled_count'] = lnc
             X['hop1_cheater_count'] = cnc
             X['hop1_cheat_rate'] = rate
             X['log_hop1_labeled'] = np.log1p(lnc)
             
-            # 2-hop disabled - path counting inflates values too much
-            # if use_hop2:
-            #     lnc2, cnc2, rate2 = graph_cache.compute_hop2_label_agg(
-            #         node_idx, fold_known_mask, fold_y
-            #     )
-            #     X['hop2_labeled_count'] = lnc2
-            #     X['hop2_cheater_count'] = cnc2
-            #     X['hop2_cheat_rate'] = rate2
-            #     X['log_hop2_labeled'] = np.log1p(lnc2)
+            # Sampled 2-hop (safe, no A^2)
+            if use_hop2:
+                hop2_score = graph_cache.compute_hop2_label_agg_sampled(
+                    node_idx, fold_known_mask, fold_y, 
+                    alpha=alpha, beta=beta, max_neighbors=hop2_max_neighbors
+                )
+                X['hop2_neighbor_rate_sampled'] = hop2_score
         
         return X
     
@@ -340,6 +351,12 @@ class BranchDRunner:
         # Map labeled users to graph indices
         labeled_node_idx = graph_cache.get_node_indices(self.labeled['user_hash'].values)
         
+        # Extract feature config
+        alpha = config.get('alpha', 1.0)
+        beta = config.get('beta', 1.0)
+        use_hop2 = config.get('use_hop2', False)
+        hop2_max_neighbors = config.get('hop2_max_neighbors', 50)
+        
         for fold, (tr_idx, val_idx) in enumerate(skf5.split(self.labeled, self.y)):
             # Build fold-safe known mask (only train fold labels)
             fold_known_mask = np.zeros(graph_cache.n_nodes, dtype=bool)
@@ -350,21 +367,34 @@ class BranchDRunner:
             fold_known_mask[train_node_idx[valid_train]] = True
             fold_y[train_node_idx[valid_train]] = self.y[tr_idx][valid_train]
             
-            # Build features
-            X_tr = self.build_features(self.labeled.iloc[tr_idx], graph_cache, fold_known_mask, fold_y)
-            X_val = self.build_features(self.labeled.iloc[val_idx], graph_cache, fold_known_mask, fold_y)
+            # Build features with configurable alpha/beta and optional hop2
+            X_tr = self.build_features(
+                self.labeled.iloc[tr_idx], graph_cache, fold_known_mask, fold_y,
+                use_hop2=use_hop2, alpha=alpha, beta=beta, hop2_max_neighbors=hop2_max_neighbors
+            )
+            X_val = self.build_features(
+                self.labeled.iloc[val_idx], graph_cache, fold_known_mask, fold_y,
+                use_hop2=use_hop2, alpha=alpha, beta=beta, hop2_max_neighbors=hop2_max_neighbors
+            )
             
             y_tr, y_val = self.y[tr_idx], self.y[val_idx]
             
-            # Train model
+            # Train model with expanded hyperparameters
             model = lgb.LGBMClassifier(
                 n_estimators=config.get('n_est', 1500),
                 learning_rate=config.get('lr', 0.03),
                 num_leaves=config.get('num_leaves', 63),
+                max_depth=config.get('max_depth', -1),
                 min_child_samples=config.get('min_child', 20),
+                min_child_weight=config.get('min_child_weight', 1e-3),
+                min_split_gain=config.get('min_split_gain', 0.0),
                 scale_pos_weight=config.get('scale_pos_weight', 3.0),
                 subsample=config.get('subsample', 0.8),
+                subsample_freq=config.get('bagging_freq', 1),
                 colsample_bytree=config.get('colsample', 0.8),
+                reg_alpha=config.get('reg_alpha', 0.0),
+                reg_lambda=config.get('reg_lambda', 0.0),
+                max_bin=config.get('max_bin', 255),
                 random_state=SEED,
                 verbose=-1,
                 n_jobs=-1
@@ -392,16 +422,15 @@ class BranchDRunner:
         return pub_cost, is_best
     
     def run_search(self, graph_cache, max_trials=80):
-        """Run hyperparameter search with grid + random configs."""
+        """Run hyperparameter search with expanded grid."""
         print(f"\nRunning search with max {max_trials} trials...")
         
-        # Config space - expanded with more fine-grained options
         configs = []
         
-        # Grid over key parameters
-        for spw in [1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 5.0]:
+        # Core grid: scale_pos_weight, leaves, lr combinations
+        for spw in [1.5, 2.0, 2.5, 3.0, 3.5, 4.0]:
             for leaves in [31, 63, 127]:
-                for lr in [0.01, 0.02, 0.03, 0.05]:
+                for lr in [0.01, 0.02, 0.03]:
                     configs.append({
                         'scale_pos_weight': spw,
                         'num_leaves': leaves,
@@ -409,13 +438,68 @@ class BranchDRunner:
                         'n_est': 1500,
                         'min_child': 20,
                         'subsample': 0.8,
-                        'colsample': 0.8
+                        'colsample': 0.8,
+                        'alpha': 1.0,
+                        'beta': 1.0
                     })
         
-        # Additional variations around promising region
-        for spw in [1.75, 2.25, 2.75]:
+        # Expanded params: max_depth, reg, min_split_gain
+        for spw in [1.5, 2.0, 2.5]:
+            for max_depth in [6, 8, 10, -1]:
+                for reg_lambda in [0.0, 0.1, 1.0]:
+                    configs.append({
+                        'scale_pos_weight': spw,
+                        'num_leaves': 63,
+                        'lr': 0.01,
+                        'n_est': 2000,
+                        'max_depth': max_depth,
+                        'min_child': 20,
+                        'reg_lambda': reg_lambda,
+                        'reg_alpha': 0.0,
+                        'subsample': 0.8,
+                        'colsample': 0.8,
+                        'alpha': 1.0,
+                        'beta': 1.0
+                    })
+        
+        # Bayesian smoothing priors: alpha/beta tuning
+        for spw in [1.5, 2.0]:
+            for alpha in [0.5, 1.0, 2.0, 4.0]:
+                for beta in [0.5, 1.0, 2.0, 4.0]:
+                    configs.append({
+                        'scale_pos_weight': spw,
+                        'num_leaves': 63,
+                        'lr': 0.01,
+                        'n_est': 1500,
+                        'min_child': 20,
+                        'subsample': 0.8,
+                        'colsample': 0.8,
+                        'alpha': alpha,
+                        'beta': beta
+                    })
+        
+        # Sampled 2-hop feature tests
+        for spw in [1.5, 2.0, 2.5]:
+            for use_hop2 in [True]:
+                for hop2_neighbors in [30, 50, 100]:
+                    configs.append({
+                        'scale_pos_weight': spw,
+                        'num_leaves': 63,
+                        'lr': 0.01,
+                        'n_est': 1500,
+                        'min_child': 20,
+                        'subsample': 0.8,
+                        'colsample': 0.8,
+                        'alpha': 1.0,
+                        'beta': 1.0,
+                        'use_hop2': use_hop2,
+                        'hop2_max_neighbors': hop2_neighbors
+                    })
+        
+        # n_estimators + early stop, min_child variations
+        for spw in [1.5, 2.0]:
             for n_est in [2000, 2500, 3000]:
-                for min_child in [10, 30, 50]:
+                for min_child in [10, 30, 50, 100]:
                     configs.append({
                         'scale_pos_weight': spw,
                         'num_leaves': 63,
@@ -423,22 +507,44 @@ class BranchDRunner:
                         'n_est': n_est,
                         'min_child': min_child,
                         'subsample': 0.8,
-                        'colsample': 0.8
+                        'colsample': 0.8,
+                        'alpha': 1.0,
+                        'beta': 1.0
                     })
         
-        # Subsample/colsample variations
-        for spw in [2.0, 2.5]:
-            for subsample in [0.7, 0.9]:
-                for colsample in [0.7, 0.9]:
-                    configs.append({
-                        'scale_pos_weight': spw,
-                        'num_leaves': 63,
-                        'lr': 0.01,
-                        'n_est': 2000,
-                        'min_child': 20,
-                        'subsample': subsample,
-                        'colsample': colsample
-                    })
+        # Subsample/colsample + bagging_freq variations
+        for spw in [1.5, 2.0]:
+            for subsample in [0.6, 0.7, 0.9]:
+                for colsample in [0.6, 0.7, 0.9]:
+                    for bagging_freq in [1, 5]:
+                        configs.append({
+                            'scale_pos_weight': spw,
+                            'num_leaves': 63,
+                            'lr': 0.01,
+                            'n_est': 1500,
+                            'min_child': 20,
+                            'subsample': subsample,
+                            'colsample': colsample,
+                            'bagging_freq': bagging_freq,
+                            'alpha': 1.0,
+                            'beta': 1.0
+                        })
+        
+        # max_bin variations
+        for spw in [1.5, 2.0]:
+            for max_bin in [127, 255, 511]:
+                configs.append({
+                    'scale_pos_weight': spw,
+                    'num_leaves': 63,
+                    'lr': 0.01,
+                    'n_est': 1500,
+                    'min_child': 20,
+                    'max_bin': max_bin,
+                    'subsample': 0.8,
+                    'colsample': 0.8,
+                    'alpha': 1.0,
+                    'beta': 1.0
+                })
         
         # Deduplicate
         seen = set()
@@ -450,7 +556,7 @@ class BranchDRunner:
                 unique.append(c)
         
         configs = unique[:max_trials]
-        print(f"  Testing {len(configs)} configurations")
+        print(f"  Testing {len(configs)} configurations (expanded search space)")
         
         for i, cfg in enumerate(configs):
             pub, is_best = self.run_trial(cfg, graph_cache)
@@ -460,7 +566,7 @@ class BranchDRunner:
         print(f"\nSearch complete. Best proxy_public: {self.best_pub:.0f}")
     
     def run_optuna_search(self, graph_cache, n_trials=50, study_name='branch_d'):
-        """Run Optuna TPE search with SQLite persistence."""
+        """Run Optuna TPE search with expanded parameters and SQLite persistence."""
         print(f"\nRunning Optuna TPE search ({n_trials} trials)...")
         
         storage_path = self.out_dir / 'optuna.db'
@@ -468,13 +574,33 @@ class BranchDRunner:
         
         def objective(trial):
             config = {
+                # Core LGBM params
                 'scale_pos_weight': trial.suggest_float('scale_pos_weight', 1.0, 6.0),
-                'num_leaves': trial.suggest_int('num_leaves', 15, 127),
+                'num_leaves': trial.suggest_int('num_leaves', 15, 255),
                 'lr': trial.suggest_float('lr', 0.005, 0.1, log=True),
                 'n_est': trial.suggest_int('n_est', 1000, 4000),
-                'min_child': trial.suggest_int('min_child', 5, 100),
-                'subsample': trial.suggest_float('subsample', 0.6, 1.0),
-                'colsample': trial.suggest_float('colsample', 0.6, 1.0),
+                'max_depth': trial.suggest_int('max_depth', -1, 12),
+                'min_child': trial.suggest_int('min_child', 5, 150),
+                'min_child_weight': trial.suggest_float('min_child_weight', 1e-5, 10, log=True),
+                'min_split_gain': trial.suggest_float('min_split_gain', 0.0, 1.0),
+                
+                # Regularization
+                'reg_alpha': trial.suggest_float('reg_alpha', 0.0, 10.0),
+                'reg_lambda': trial.suggest_float('reg_lambda', 0.0, 10.0),
+                
+                # Sampling
+                'subsample': trial.suggest_float('subsample', 0.5, 1.0),
+                'colsample': trial.suggest_float('colsample', 0.5, 1.0),
+                'bagging_freq': trial.suggest_int('bagging_freq', 0, 10),
+                'max_bin': trial.suggest_categorical('max_bin', [127, 255, 511]),
+                
+                # Bayesian smoothing priors (log-scale suggested)
+                'alpha': trial.suggest_float('alpha', 0.25, 8.0, log=True),
+                'beta': trial.suggest_float('beta', 0.25, 8.0, log=True),
+                
+                # Sampled 2-hop
+                'use_hop2': trial.suggest_categorical('use_hop2', [False, True]),
+                'hop2_max_neighbors': trial.suggest_int('hop2_max_neighbors', 20, 100),
             }
             pub_cost, _ = self.run_trial(config, graph_cache)
             return pub_cost
@@ -515,18 +641,39 @@ class BranchDRunner:
         full_known_mask[all_node_idx[valid]] = True
         full_y[all_node_idx[valid]] = self.y[valid]
         
-        X_train_full = self.build_features(self.labeled, graph_cache, full_known_mask, full_y)
-        X_test = self.build_features(self.test, graph_cache, full_known_mask, full_y)
-        
         for rank, r in enumerate(top5):
             cfg = r['config']
             
+            # Extract feature config
+            alpha = cfg.get('alpha', 1.0)
+            beta = cfg.get('beta', 1.0)
+            use_hop2 = cfg.get('use_hop2', False)
+            hop2_max_neighbors = cfg.get('hop2_max_neighbors', 50)
+            
+            X_train_full = self.build_features(
+                self.labeled, graph_cache, full_known_mask, full_y,
+                use_hop2=use_hop2, alpha=alpha, beta=beta, hop2_max_neighbors=hop2_max_neighbors
+            )
+            X_test = self.build_features(
+                self.test, graph_cache, full_known_mask, full_y,
+                use_hop2=use_hop2, alpha=alpha, beta=beta, hop2_max_neighbors=hop2_max_neighbors
+            )
+            
             model = lgb.LGBMClassifier(
-                n_estimators=min(3000, cfg.get('n_est', 1500) * 2),
+                n_estimators=min(4000, cfg.get('n_est', 1500) * 2),
                 learning_rate=cfg.get('lr', 0.03),
                 num_leaves=cfg.get('num_leaves', 63),
+                max_depth=cfg.get('max_depth', -1),
                 min_child_samples=cfg.get('min_child', 20),
+                min_child_weight=cfg.get('min_child_weight', 1e-3),
+                min_split_gain=cfg.get('min_split_gain', 0.0),
                 scale_pos_weight=cfg.get('scale_pos_weight', 3.0),
+                subsample=cfg.get('subsample', 0.8),
+                subsample_freq=cfg.get('bagging_freq', 1),
+                colsample_bytree=cfg.get('colsample', 0.8),
+                reg_alpha=cfg.get('reg_alpha', 0.0),
+                reg_lambda=cfg.get('reg_lambda', 0.0),
+                max_bin=cfg.get('max_bin', 255),
                 random_state=SEED,
                 verbose=-1,
                 n_jobs=-1
