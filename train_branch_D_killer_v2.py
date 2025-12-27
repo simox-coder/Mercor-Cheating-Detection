@@ -160,7 +160,15 @@ class GraphCache:
         """
         Optimized fold-safe 1-hop label aggregation.
         Only computes for requested nodes via CSR row-slicing (O(n_requested) not O(n_nodes)).
+        Handles invalid indices (-1) safely.
         """
+        n_req = len(node_indices)
+        prior = alpha / (alpha + beta)
+        
+        # Handle invalid indices: create valid mask and safe indices
+        valid_mask = node_indices >= 0
+        safe_idx = np.where(valid_mask, node_indices, 0)  # Replace -1 with 0 for indexing
+        
         # Create label vector (0 for unknown)
         y_full = np.zeros(self.n_nodes, dtype=np.float32)
         y_full[known_mask] = y_values[known_mask]
@@ -168,14 +176,17 @@ class GraphCache:
         y_known = y_full * known_float
         
         # Row-slice adjacency for only requested nodes (fast)
-        sub_adj = self.adj_csr[node_indices]  # shape: (len(node_indices), n_nodes)
+        sub_adj = self.adj_csr[safe_idx]  # shape: (len(node_indices), n_nodes)
         
         # Compute aggregates only for requested rows
         lnc = np.array(sub_adj @ known_float).flatten()  # labeled neighbor count
         cnc = np.array(sub_adj @ y_known).flatten()      # cheater neighbor count
         
+        # Set invalid rows to defaults (0, 0, prior)
+        lnc = np.where(valid_mask, lnc, 0)
+        cnc = np.where(valid_mask, cnc, 0)
+        
         # Bayesian smoothed rate
-        prior = alpha / (alpha + beta)
         rate = np.where(lnc > 0, (cnc + alpha) / (lnc + alpha + beta), prior)
         
         return lnc, cnc, rate
@@ -478,23 +489,12 @@ class BranchDRunner:
                         'beta': beta
                     })
         
-        # Sampled 2-hop feature tests
-        for spw in [1.5, 2.0, 2.5]:
-            for use_hop2 in [True]:
-                for hop2_neighbors in [30, 50, 100]:
-                    configs.append({
-                        'scale_pos_weight': spw,
-                        'num_leaves': 63,
-                        'lr': 0.01,
-                        'n_est': 1500,
-                        'min_child': 20,
-                        'subsample': 0.8,
-                        'colsample': 0.8,
-                        'alpha': 1.0,
-                        'beta': 1.0,
-                        'use_hop2': use_hop2,
-                        'hop2_max_neighbors': hop2_neighbors
-                    })
+        # Sampled 2-hop feature tests - DISABLED for speed (full matvec too slow)
+        # To re-enable, rewrite hop2 to avoid full adj@vector computation
+        # for spw in [1.5, 2.0, 2.5]:
+        #     for use_hop2 in [True]:
+        #         for hop2_neighbors in [30, 50, 100]:
+        #             configs.append({...})
         
         # n_estimators + early stop, min_child variations
         for spw in [1.5, 2.0]:
@@ -598,9 +598,8 @@ class BranchDRunner:
                 'alpha': trial.suggest_float('alpha', 0.25, 8.0, log=True),
                 'beta': trial.suggest_float('beta', 0.25, 8.0, log=True),
                 
-                # Sampled 2-hop
-                'use_hop2': trial.suggest_categorical('use_hop2', [False, True]),
-                'hop2_max_neighbors': trial.suggest_int('hop2_max_neighbors', 20, 100),
+                # Disable hop2 for speed (full matvec too slow)
+                'use_hop2': False,
             }
             pub_cost, _ = self.run_trial(config, graph_cache)
             return pub_cost
