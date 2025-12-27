@@ -191,6 +191,83 @@ class GraphCache:
         
         return lnc, cnc, rate
     
+    def compute_component_prior_features(self, node_indices, known_mask, y_values, alpha=1.0, beta=1.0):
+        """
+        Fold-safe component-level label statistics.
+        For each node, compute stats about its connected component using only train-fold labels.
+        Handles invalid indices (-1) safely.
+        """
+        n_req = len(node_indices)
+        prior = alpha / (alpha + beta)
+        
+        # Handle invalid indices
+        valid_mask = node_indices >= 0
+        safe_idx = np.where(valid_mask, node_indices, 0)
+        
+        # Get component labels for requested nodes
+        comp_labels = self.component_labels[safe_idx]
+        
+        # Compute per-component stats using only known (train-fold) labels
+        # First, aggregate labeled/cheater counts per component
+        n_comps = len(self.component_size)
+        comp_labeled_cnt = np.zeros(n_comps, dtype=np.float32)
+        comp_cheater_cnt = np.zeros(n_comps, dtype=np.float32)
+        
+        # Sum over all nodes in graph that are known
+        known_node_idx = np.where(known_mask)[0]
+        for nidx in known_node_idx:
+            comp_id = self.component_labels[nidx]
+            comp_labeled_cnt[comp_id] += 1
+            comp_cheater_cnt[comp_id] += y_values[nidx]
+        
+        # Now get features for requested nodes
+        comp_labeled = comp_labeled_cnt[comp_labels]
+        comp_cheater = comp_cheater_cnt[comp_labels]
+        comp_rate = np.where(comp_labeled > 0, 
+                            (comp_cheater + alpha) / (comp_labeled + alpha + beta),
+                            prior)
+        comp_has_cheater = (comp_cheater > 0).astype(np.float32)
+        
+        # Set invalid rows to defaults
+        comp_labeled = np.where(valid_mask, comp_labeled, 0)
+        comp_cheater = np.where(valid_mask, comp_cheater, 0)
+        comp_rate = np.where(valid_mask, comp_rate, prior)
+        comp_has_cheater = np.where(valid_mask, comp_has_cheater, 0)
+        
+        return comp_labeled, comp_cheater, comp_rate, comp_has_cheater
+    
+    def compute_neighbor_mean_features(self, node_indices):
+        """
+        Compute neighbor mean features for requested nodes via CSR row-slice.
+        Features: nbr_degree_mean, nbr_comp_size_mean
+        Handles invalid indices (-1) safely.
+        """
+        n_req = len(node_indices)
+        
+        # Handle invalid indices
+        valid_mask = node_indices >= 0
+        safe_idx = np.where(valid_mask, node_indices, 0)
+        
+        # Row-slice adjacency for requested nodes
+        sub_adj = self.adj_csr[safe_idx]
+        
+        # For each requested node, compute mean of neighbor degrees
+        # sub_adj @ degree gives sum of neighbor degrees, then divide by degree
+        nbr_degree_sum = np.array(sub_adj @ self.degree.astype(np.float32)).flatten()
+        my_degree = self.degree[safe_idx].astype(np.float32)
+        nbr_degree_mean = np.where(my_degree > 0, nbr_degree_sum / my_degree, 0)
+        
+        # Mean of neighbor component sizes
+        nbr_comp_sizes = self.component_size[self.component_labels].astype(np.float32)
+        nbr_compsize_sum = np.array(sub_adj @ nbr_comp_sizes).flatten()
+        nbr_compsize_mean = np.where(my_degree > 0, nbr_compsize_sum / my_degree, 0)
+        
+        # Set invalid rows to 0
+        nbr_degree_mean = np.where(valid_mask, nbr_degree_mean, 0)
+        nbr_compsize_mean = np.where(valid_mask, nbr_compsize_mean, 0)
+        
+        return nbr_degree_mean, nbr_compsize_mean
+
     def compute_hop2_label_agg_sampled(self, node_indices, known_mask, y_values, alpha=1.0, beta=1.0, max_neighbors=50):
         """
         Sampled 2-hop label aggregation. For each requested node, sample up to max_neighbors
@@ -300,6 +377,23 @@ class BranchDRunner:
             X['hop1_cheater_count'] = cnc
             X['hop1_cheat_rate'] = rate
             X['log_hop1_labeled'] = np.log1p(lnc)
+            
+            # Component-level fold-safe label stats
+            comp_labeled, comp_cheater, comp_rate, comp_has_cheater = graph_cache.compute_component_prior_features(
+                node_idx, fold_known_mask, fold_y, alpha=alpha, beta=beta
+            )
+            X['comp_labeled_count'] = comp_labeled
+            X['comp_cheater_count'] = comp_cheater
+            X['comp_cheat_rate'] = comp_rate
+            X['comp_has_cheater'] = comp_has_cheater
+            X['log_comp_labeled'] = np.log1p(comp_labeled)
+            
+            # Neighbor mean features (cheap CSR row-slice)
+            nbr_deg_mean, nbr_comp_mean = graph_cache.compute_neighbor_mean_features(node_idx)
+            X['nbr_degree_mean'] = nbr_deg_mean
+            X['nbr_comp_size_mean'] = nbr_comp_mean
+            X['log_nbr_deg_mean'] = np.log1p(nbr_deg_mean)
+            X['log_nbr_comp_mean'] = np.log1p(nbr_comp_mean)
             
             # Sampled 2-hop (safe, no A^2)
             if use_hop2:
@@ -411,7 +505,15 @@ class BranchDRunner:
                 n_jobs=-1
             )
             model.fit(X_tr, y_tr)
-            oof[val_idx] = model.predict_proba(X_val)[:, 1]
+            model_pred = model.predict_proba(X_val)[:, 1]
+            
+            # Blend with comp_cheat_rate if blend_weight specified
+            blend_weight = config.get('blend_weight', 1.0)  # w=1 means pure model
+            if blend_weight < 1.0 and 'comp_cheat_rate' in X_val.columns:
+                comp_rate_val = X_val['comp_cheat_rate'].values
+                oof[val_idx] = blend_weight * model_pred + (1 - blend_weight) * comp_rate_val
+            else:
+                oof[val_idx] = model_pred
         
         # Evaluate
         cv_cost, details = score_with_details(self.y, oof)
@@ -597,6 +699,9 @@ class BranchDRunner:
                 # Bayesian smoothing priors (log-scale suggested)
                 'alpha': trial.suggest_float('alpha', 0.25, 8.0, log=True),
                 'beta': trial.suggest_float('beta', 0.25, 8.0, log=True),
+                
+                # Blend weight: final_pred = w*model_pred + (1-w)*comp_cheat_rate
+                'blend_weight': trial.suggest_float('blend_weight', 0.7, 1.0),
                 
                 # Disable hop2 for speed (full matvec too slow)
                 'use_hop2': False,
