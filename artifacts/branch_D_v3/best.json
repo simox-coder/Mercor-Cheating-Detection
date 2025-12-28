@@ -1,0 +1,28 @@
+{
+  "trial_id": 3,
+  "config": {
+    "scale_pos_weight": 5.282970263056656,
+    "num_leaves": 62,
+    "lr": 0.009797486029339582,
+    "n_est": 8000,
+    "min_child": 79,
+    "reg_lambda": 4.56069984217036,
+    "subsample": 0.9140703845572055,
+    "colsample": 0.6798695128633439,
+    "alpha": 2.121973486810424,
+    "beta": 2.9372934663073202,
+    "blend_weight": 0.046450412719997725,
+    "use_hop2": false,
+    "max_depth": -1,
+    "min_child_weight": 0.001,
+    "min_split_gain": 0.0,
+    "reg_alpha": 0.0,
+    "bagging_freq": 1,
+    "max_bin": 255
+  },
+  "cv_cost": 5012800.0,
+  "proxy_public": 2500550.0,
+  "proxy_private": 2512250.0,
+  "t_low": 0.21,
+  "t_high": 0.4
+}

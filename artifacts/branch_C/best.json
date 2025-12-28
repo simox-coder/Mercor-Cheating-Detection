@@ -1,0 +1,6 @@
+{
+  "model_type": "lgb_label_prop",
+  "cv_cost": 4411350.0,
+  "proxy_public_cost": 2194250.0,
+  "proxy_private_cost": 2210450.0
+}
