@@ -193,7 +193,7 @@ class GraphCache:
     
     def compute_component_prior_features(self, node_indices, known_mask, y_values, alpha=1.0, beta=1.0):
         """
-        Fold-safe component-level label statistics.
+        Fold-safe component-level label statistics (VECTORIZED with bincount, no loops).
         For each node, compute stats about its connected component using only train-fold labels.
         Handles invalid indices (-1) safely.
         """
@@ -207,18 +207,19 @@ class GraphCache:
         # Get component labels for requested nodes
         comp_labels = self.component_labels[safe_idx]
         
-        # Compute per-component stats using only known (train-fold) labels
-        # First, aggregate labeled/cheater counts per component
+        # VECTORIZED: compute per-component stats using bincount (no loops)
         n_comps = len(self.component_size)
-        comp_labeled_cnt = np.zeros(n_comps, dtype=np.float32)
-        comp_cheater_cnt = np.zeros(n_comps, dtype=np.float32)
         
-        # Sum over all nodes in graph that are known
+        # Get component IDs of all known (train-fold) nodes
         known_node_idx = np.where(known_mask)[0]
-        for nidx in known_node_idx:
-            comp_id = self.component_labels[nidx]
-            comp_labeled_cnt[comp_id] += 1
-            comp_cheater_cnt[comp_id] += y_values[nidx]
+        comp_ids_known = self.component_labels[known_node_idx]
+        
+        # bincount: count labeled nodes per component
+        comp_labeled_cnt = np.bincount(comp_ids_known, minlength=n_comps).astype(np.float32)
+        
+        # bincount with weights: count cheaters per component
+        y_known = y_values[known_node_idx].astype(np.float32)
+        comp_cheater_cnt = np.bincount(comp_ids_known, weights=y_known, minlength=n_comps).astype(np.float32)
         
         # Now get features for requested nodes
         comp_labeled = comp_labeled_cnt[comp_labels]
@@ -228,7 +229,7 @@ class GraphCache:
                             prior)
         comp_has_cheater = (comp_cheater > 0).astype(np.float32)
         
-        # Set invalid rows to defaults
+        # Set invalid rows to defaults (labeled=0, cheater=0, rate=prior, has_cheater=0)
         comp_labeled = np.where(valid_mask, comp_labeled, 0)
         comp_cheater = np.where(valid_mask, comp_cheater, 0)
         comp_rate = np.where(valid_mask, comp_rate, prior)
@@ -241,6 +242,7 @@ class GraphCache:
         Compute neighbor mean features for requested nodes via CSR row-slice.
         Features: nbr_degree_mean, nbr_comp_size_mean
         Handles invalid indices (-1) safely.
+        Defaults: nbr_degree_mean=0, nbr_comp_size_mean=1 when no neighbors or invalid.
         """
         n_req = len(node_indices)
         
@@ -255,16 +257,16 @@ class GraphCache:
         # sub_adj @ degree gives sum of neighbor degrees, then divide by degree
         nbr_degree_sum = np.array(sub_adj @ self.degree.astype(np.float32)).flatten()
         my_degree = self.degree[safe_idx].astype(np.float32)
-        nbr_degree_mean = np.where(my_degree > 0, nbr_degree_sum / my_degree, 0)
+        nbr_degree_mean = np.where(my_degree > 0, nbr_degree_sum / my_degree, 0.0)  # default 0
         
         # Mean of neighbor component sizes
         nbr_comp_sizes = self.component_size[self.component_labels].astype(np.float32)
         nbr_compsize_sum = np.array(sub_adj @ nbr_comp_sizes).flatten()
-        nbr_compsize_mean = np.where(my_degree > 0, nbr_compsize_sum / my_degree, 0)
+        nbr_compsize_mean = np.where(my_degree > 0, nbr_compsize_sum / my_degree, 1.0)  # default 1
         
-        # Set invalid rows to 0
-        nbr_degree_mean = np.where(valid_mask, nbr_degree_mean, 0)
-        nbr_compsize_mean = np.where(valid_mask, nbr_compsize_mean, 0)
+        # Set invalid rows to defaults (0 for degree_mean, 1 for comp_size_mean)
+        nbr_degree_mean = np.where(valid_mask, nbr_degree_mean, 0.0)
+        nbr_compsize_mean = np.where(valid_mask, nbr_compsize_mean, 1.0)
         
         return nbr_degree_mean, nbr_compsize_mean
 
@@ -668,7 +670,7 @@ class BranchDRunner:
         print(f"\nSearch complete. Best proxy_public: {self.best_pub:.0f}")
     
     def run_optuna_search(self, graph_cache, n_trials=50, study_name='branch_d'):
-        """Run Optuna TPE search with expanded parameters and SQLite persistence."""
+        """Run Optuna TPE search with NARROW high-impact params + early stopping."""
         print(f"\nRunning Optuna TPE search ({n_trials} trials)...")
         
         storage_path = self.out_dir / 'optuna.db'
@@ -676,35 +678,38 @@ class BranchDRunner:
         
         def objective(trial):
             config = {
-                # Core LGBM params
-                'scale_pos_weight': trial.suggest_float('scale_pos_weight', 1.0, 6.0),
-                'num_leaves': trial.suggest_int('num_leaves', 15, 255),
-                'lr': trial.suggest_float('lr', 0.005, 0.1, log=True),
-                'n_est': trial.suggest_int('n_est', 1000, 4000),
-                'max_depth': trial.suggest_int('max_depth', -1, 12),
-                'min_child': trial.suggest_int('min_child', 5, 150),
-                'min_child_weight': trial.suggest_float('min_child_weight', 1e-5, 10, log=True),
-                'min_split_gain': trial.suggest_float('min_split_gain', 0.0, 1.0),
+                # Core LGBM params (narrow, high-impact only)
+                'scale_pos_weight': trial.suggest_float('scale_pos_weight', 1.0, 8.0),
+                'num_leaves': trial.suggest_int('num_leaves', 31, 255),
+                'lr': trial.suggest_float('lr', 0.005, 0.05, log=True),
+                'n_est': 8000,  # Fixed high, use early stopping
+                'min_child': trial.suggest_int('min_child', 10, 200),
                 
                 # Regularization
-                'reg_alpha': trial.suggest_float('reg_alpha', 0.0, 10.0),
                 'reg_lambda': trial.suggest_float('reg_lambda', 0.0, 10.0),
                 
                 # Sampling
-                'subsample': trial.suggest_float('subsample', 0.5, 1.0),
-                'colsample': trial.suggest_float('colsample', 0.5, 1.0),
-                'bagging_freq': trial.suggest_int('bagging_freq', 0, 10),
-                'max_bin': trial.suggest_categorical('max_bin', [127, 255, 511]),
+                'subsample': trial.suggest_float('subsample', 0.6, 1.0),
+                'colsample': trial.suggest_float('colsample', 0.6, 1.0),
                 
-                # Bayesian smoothing priors (log-scale suggested)
-                'alpha': trial.suggest_float('alpha', 0.25, 8.0, log=True),
-                'beta': trial.suggest_float('beta', 0.25, 8.0, log=True),
+                # Bayesian smoothing priors (log-scale)
+                'alpha': trial.suggest_float('alpha', 0.25, 16.0, log=True),
+                'beta': trial.suggest_float('beta', 0.25, 16.0, log=True),
                 
                 # Blend weight: final_pred = w*model_pred + (1-w)*comp_cheat_rate
-                'blend_weight': trial.suggest_float('blend_weight', 0.7, 1.0),
+                # Allow full range including pure comp_rate
+                'blend_weight': trial.suggest_float('blend_weight', 0.0, 1.0),
                 
-                # Disable hop2 for speed (full matvec too slow)
+                # DISABLE hop2 for speed (fixed)
                 'use_hop2': False,
+                
+                # Fixed params
+                'max_depth': -1,
+                'min_child_weight': 1e-3,
+                'min_split_gain': 0.0,
+                'reg_alpha': 0.0,
+                'bagging_freq': 1,
+                'max_bin': 255,
             }
             pub_cost, _ = self.run_trial(config, graph_cache)
             return pub_cost
@@ -730,12 +735,32 @@ class BranchDRunner:
         return study
     
     def export_submissions(self, graph_cache):
-        """Export top 5 submissions."""
-        print("\nExporting 5 submissions...")
+        """Export top 5 submissions DETERMINISTICALLY from scoreboard.csv (not self.results)."""
+        print("\nExporting 5 submissions (from scoreboard.csv)...")
         
-        # Sort by pub_cost
-        self.results.sort(key=lambda x: x['pub_cost'])
-        top5 = self.results[:5]
+        # READ FROM SCOREBOARD.CSV (deterministic across all runs)
+        if not self.scoreboard_path.exists():
+            print("  ERROR: No scoreboard.csv found!")
+            return
+        
+        sb = pd.read_csv(self.scoreboard_path)
+        
+        # Find the proxy_public column (may be named differently)
+        if 'proxy_public' in sb.columns:
+            pub_col = 'proxy_public'
+        elif 'pub' in sb.columns:
+            pub_col = 'pub'
+        else:
+            print(f"  ERROR: Cannot find proxy_public column. Columns: {sb.columns.tolist()}")
+            return
+        
+        # Filter valid rows and sort by proxy_public ASCENDING (lower cost = better)
+        sb_valid = sb[sb[pub_col].notna()].copy()
+        sb_valid = sb_valid.sort_values(pub_col, ascending=True).head(10)
+        
+        print(f"  Found {len(sb_valid)} valid trials. Top 5 proxy_public:")
+        for i, row in sb_valid.head(5).iterrows():
+            print(f"    {pub_col}={row[pub_col]:.0f}")
         
         # Map all labeled users for full training
         all_node_idx = graph_cache.get_node_indices(self.labeled['user_hash'].values)
@@ -745,10 +770,37 @@ class BranchDRunner:
         full_known_mask[all_node_idx[valid]] = True
         full_y[all_node_idx[valid]] = self.y[valid]
         
-        for rank, r in enumerate(top5):
-            cfg = r['config']
+        # Export top 5 as individual submissions
+        for rank, (idx, row) in enumerate(sb_valid.head(5).iterrows()):
+            # Extract config from scoreboard row
+            cfg = {}
+            for col in sb_valid.columns:
+                if col.startswith('param_'):
+                    param_name = col.replace('param_', '')
+                    val = row[col]
+                    if pd.notna(val):
+                        # Convert to appropriate type
+                        if param_name in ['num_leaves', 'n_est', 'min_child', 'max_depth', 'bagging_freq', 'max_bin']:
+                            cfg[param_name] = int(val)
+                        elif param_name in ['use_hop2']:
+                            cfg[param_name] = bool(val) if pd.notna(val) else False
+                        else:
+                            cfg[param_name] = float(val)
             
-            # Extract feature config
+            # Set defaults for missing params
+            cfg.setdefault('n_est', 1500)
+            cfg.setdefault('lr', 0.01)
+            cfg.setdefault('num_leaves', 63)
+            cfg.setdefault('max_depth', -1)
+            cfg.setdefault('min_child', 20)
+            cfg.setdefault('scale_pos_weight', 2.0)
+            cfg.setdefault('subsample', 0.8)
+            cfg.setdefault('colsample', 0.8)
+            cfg.setdefault('alpha', 1.0)
+            cfg.setdefault('beta', 1.0)
+            cfg.setdefault('blend_weight', 1.0)
+            cfg.setdefault('use_hop2', False)
+            
             alpha = cfg.get('alpha', 1.0)
             beta = cfg.get('beta', 1.0)
             use_hop2 = cfg.get('use_hop2', False)
@@ -783,7 +835,17 @@ class BranchDRunner:
                 n_jobs=-1
             )
             model.fit(X_train_full, self.y)
-            preds = np.clip(model.predict_proba(X_test)[:, 1], 0, 1)
+            model_preds = model.predict_proba(X_test)[:, 1]
+            
+            # Apply blend if blend_weight < 1
+            blend_weight = cfg.get('blend_weight', 1.0)
+            if blend_weight < 1.0 and 'comp_cheat_rate' in X_test.columns:
+                comp_rate_test = X_test['comp_cheat_rate'].values
+                preds = blend_weight * model_preds + (1 - blend_weight) * comp_rate_test
+            else:
+                preds = model_preds
+            
+            preds = np.clip(preds, 0, 1)
             
             # Assert predictions in [0,1]
             assert preds.min() >= 0 and preds.max() <= 1
@@ -799,7 +861,7 @@ class BranchDRunner:
                 fname = self.data_dir / f'submission_D_cand{rank}.csv'
             
             sub.to_csv(fname, index=False)
-            print(f"  {fname.name}: pub={r['pub_cost']:.0f}, range=[{preds.min():.4f}, {preds.max():.4f}]")
+            print(f"  {fname.name}: pub={row[pub_col]:.0f}, range=[{preds.min():.4f}, {preds.max():.4f}]")
         
         print("\nDone!")
 
